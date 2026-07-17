@@ -263,6 +263,7 @@
 
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
 <script>
 // ─── Data store ───────────────────────────────────────────────
 let data = {
@@ -273,38 +274,13 @@ let data = {
   ]
 };
 
-// ─── Persistence (localStorage) ────────────────────────────────
-const STORAGE_KEY = 'bg_mfg_dashboard_data';
-
-function saveData() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  } catch (err) {
-    console.error('Could not save dashboard data:', err);
-  }
-}
-
-function loadData() {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
-      const parsed = JSON.parse(saved);
-      if (parsed && parsed.weekEnd && Array.isArray(parsed.rows)) {
-        data = parsed;
-      }
-    }
-  } catch (err) {
-    console.error('Could not load saved dashboard data, using defaults:', err);
-  }
-}
-
-loadData();
-
 // ─── Station rotation engine ──────────────────────────────────
 const STATIONS = ['A', 'B', 'C', 'D', 'E'];
 const PREP_ORDER = ['Betty', 'Anna', 'Gris', 'Lupita', 'Gaby', 'Giovy'];
 
 // Seed = actual 5:00 AM lineup for 7/13/2026, verified against that day's sheet.
+// Only used as a fallback default if Supabase has no row yet - once synced,
+// the live state in Supabase is the source of truth.
 const ROTATION_SEED = {
   date: '2026-07-13',
   prepIndex: 0, // Betty
@@ -313,6 +289,79 @@ const ROTATION_SEED = {
 
 let rotationState = JSON.parse(JSON.stringify(ROTATION_SEED));
 let absences = {}; // { workerName: true } — today only, display-level override
+
+// ─── Persistence (Supabase) ────────────────────────────────────
+// Fill these in from Project Settings > API in your Supabase dashboard.
+const SUPABASE_URL = 'https://icoefepnzufwilhyzaik.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imljb2VmZXBuenVmd2lsaHl6YWlrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQzMDc0MzksImV4cCI6MjA5OTg4MzQzOX0.qCooXJDbqKKKRcyb5J4pUrZk0C7lD4sVXpzTO6cUI8Q';
+const DASH_KEY = 'bg_mfg_dashboard_data';
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// Whole synced state = production KPIs + rotation + today's call-outs,
+// so any browser (Fire TV, your laptop, your boss's screen) shows the
+// same live picture, not just the KPI numbers.
+function buildPayload() {
+  return { weekEnd: data.weekEnd, rows: data.rows, rotationState, absences };
+}
+
+function applyPayload(payload) {
+  if (payload && payload.weekEnd && Array.isArray(payload.rows)) {
+    data = { weekEnd: payload.weekEnd, rows: payload.rows };
+  }
+  if (payload && payload.rotationState) {
+    rotationState = payload.rotationState;
+  }
+  if (payload && payload.absences) {
+    absences = payload.absences;
+  }
+}
+
+async function saveData() {
+  try {
+    const { error } = await sb
+      .from('dashboard_state')
+      .update({ payload: buildPayload() })
+      .eq('dash_key', DASH_KEY);
+    if (error) throw error;
+  } catch (err) {
+    console.error('Could not save dashboard data to Supabase:', err);
+    // The UI already reflects the change locally; the next successful
+    // save (or another screen's save) will catch the database back up.
+  }
+}
+
+async function loadData() {
+  try {
+    const { data: rows, error } = await sb
+      .from('dashboard_state')
+      .select('payload')
+      .eq('dash_key', DASH_KEY)
+      .limit(1);
+    if (error) throw error;
+    if (rows && rows[0]) {
+      applyPayload(rows[0].payload);
+    }
+  } catch (err) {
+    console.error('Could not load dashboard data from Supabase, using defaults:', err);
+  }
+}
+
+// Live sync: a change made on any screen (Fire TV, boss's laptop, yours)
+// pushes to every other open screen within a second or two - no manual
+// refresh needed.
+function initRealtimeSync() {
+  sb.channel('dashboard_state_changes')
+    .on('postgres_changes',
+      { event: 'UPDATE', schema: 'public', table: 'dashboard_state', filter: `dash_key=eq.${DASH_KEY}` },
+      (payload) => {
+        applyPayload(payload.new.payload);
+        render();
+        renderRotation();
+      }
+    )
+    .subscribe();
+}
 
 function rotateStations(order) {
   // Last person (E) moves to front (A); everyone else shifts down one slot.
@@ -346,6 +395,7 @@ function advanceRotationDay() {
   rotationState = { date: null, prepIndex: nextPrepIndex, stationOrder: nextOrder };
   absences = {};
   renderRotation();
+  saveData();
 }
 
 function applyAbsences() {
@@ -355,6 +405,7 @@ function applyAbsences() {
     if (box && box.checked) { absences[name] = true; }
   });
   renderRotation();
+  saveData();
 }
 
 function renderRotation() {
@@ -499,8 +550,14 @@ document.addEventListener('keydown', e => {
 });
 
 // ─── Init ─────────────────────────────────────────────────────
-render();
+render();        // paint immediately with defaults so the TV never shows a blank screen
 renderRotation();
+
+loadData().then(() => {
+  render();       // repaint with the real synced data once it arrives
+  renderRotation();
+  initRealtimeSync();
+});
 </script>
 </body>
 </html>
